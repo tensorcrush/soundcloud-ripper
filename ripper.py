@@ -16,6 +16,7 @@ init(autoreset=True)
 
 CHARSET = string.ascii_letters + string.digits
 PRIVATE_RE = re.compile(r"/s-[a-zA-Z0-9]{11}")
+API = "https://api-v2.soundcloud.com"
 
 
 class Stats:
@@ -39,6 +40,38 @@ def parse_track(url):
     if len(parts) >= 2:
         return parts[0], parts[1]
     return None, None
+
+
+async def fetch_client_id(session):
+    try:
+        async with session.get("https://soundcloud.com") as r:
+            html = await r.text()
+        scripts = re.findall(r'<script[^>]+src="(https://a-v2\.sndcdn\.com/assets/[^"]+\.js)"', html)
+        for url in reversed(scripts):
+            try:
+                async with session.get(url) as r:
+                    js = await r.text()
+                m = re.search(r'client_id:"([a-zA-Z0-9]{32})"', js)
+                if m:
+                    return m.group(1)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+async def verify(session, url, client_id):
+    try:
+        async with session.get(f"{API}/resolve", params={"client_id": client_id, "url": url}) as r:
+            if r.status == 404:
+                return False
+            if r.status == 200:
+                data = await r.json()
+                return data.get("sharing") == "private"
+    except Exception:
+        pass
+    return True
 
 
 async def probe(session, sem, stats, verbose):
@@ -85,7 +118,7 @@ async def run(concurrency, verbose, out, limit):
             existing = json.loads(out.read_text())
             results = existing
             seen = set(existing)
-            print(f"{Fore.YELLOW}  resuming — {len(seen)} tracks already in {out}{Style.RESET_ALL}\n")
+            print(f"{Fore.YELLOW}  resuming - {len(seen)} tracks already in {out}{Style.RESET_ALL}\n")
         except Exception:
             pass
 
@@ -104,6 +137,14 @@ async def run(concurrency, verbose, out, limit):
         headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
         timeout=aiohttp.ClientTimeout(total=10, connect=5),
     ) as session:
+        print(f"  {Fore.WHITE}fetching client_id...{Style.RESET_ALL}", end=" ", flush=True)
+        client_id = await fetch_client_id(session)
+        if client_id:
+            print(f"{Fore.GREEN}ok{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.YELLOW}failed — deleted tracks won't be filtered{Style.RESET_ALL}")
+        print()
+
         sem = asyncio.Semaphore(concurrency)
         tasks = set()
         stat_task = asyncio.create_task(stat_loop(stats, stop))
@@ -122,17 +163,24 @@ async def run(concurrency, verbose, out, limit):
 
                 for t in done:
                     url = t.result()
-                    if url and url not in seen:
-                        seen.add(url)
-                        stats.hits += 1
-                        results.append(url)
-                        artist, track = parse_track(url)
-                        label = f"{artist} — {track}" if artist else url
-                        print(f"\n{Fore.GREEN}[+] {label}{Style.RESET_ALL}")
-                        print(f"    {Fore.WHITE}{url}{Style.RESET_ALL}")
-                        out.write_text(json.dumps(results, indent=2))
-                        if limit and stats.hits >= limit:
-                            raise KeyboardInterrupt
+                    if not url or url in seen:
+                        continue
+
+                    if client_id and not await verify(session, url, client_id):
+                        if verbose >= 1:
+                            print(f"\n{Fore.RED}  x deleted  {url}{Style.RESET_ALL}")
+                        continue
+
+                    seen.add(url)
+                    stats.hits += 1
+                    results.append(url)
+                    artist, track = parse_track(url)
+                    label = f"{artist} - {track}" if artist else url
+                    print(f"\n{Fore.GREEN}[+] {label}{Style.RESET_ALL}")
+                    print(f"    {Fore.WHITE}{url}{Style.RESET_ALL}")
+                    out.write_text(json.dumps(results, indent=2))
+                    if limit and stats.hits >= limit:
+                        raise KeyboardInterrupt
 
         except (KeyboardInterrupt, asyncio.CancelledError):
             stop.set()
