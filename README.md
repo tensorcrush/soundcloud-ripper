@@ -1,54 +1,45 @@
-# sound-cloudripper
+# soundcloud-ripper v2
 
-[![Python](https://img.shields.io/badge/Python-v3.11-yellow)]()
+[![Python](https://img.shields.io/badge/Python-3.10+-yellow)]()
 
-a tool whichs basically finds private soundcloud tracks by bruteforcing shareable links of on.soundcloud.com
+Bruteforce random SoundCloud shortlinks (`on.soundcloud.com/XXXXX`) to surface private tracks.
+
+**How it works:** SoundCloud shortlinks redirect (302) to the real track URL. Private tracks carry a secret token (`/s-XXXXXXXXXXX`) in that URL — public ones don't. This tool fires hundreds of random probes per second and catches those tokens.
+
+---
+
+> Educational purposes only. Use at your own risk.
+
+---
+
+## Install
+
+```bash
+pip install -r requirements.txt
 ```
-Shareable soundcloud links are shrinked links, who look like this :
-=> on.soundcloud.com/XXXXX => code 302 :redirect => soundcloud.com/artist/track),
-and this can redirect to public tracks as well as private ones too... bruteforce time.
 
-the script catchs the redirect, and uses a regex to find if the full link contains a private token (public ones does not have any)
-and if the regex matches, then a private track has been found.
+## Usage
 
-actually, because of the regex-only filter theres some false-positives:
--old private tracks who kept their same shareable link, which are public now, will stiff have a private token on the link;
--sometimes deleted tracks does match.
+```bash
+# default — 200 concurrent workers
+python ripper.py
 
-this is easy to fix tho, i just need to do it :')
+# crank it up
+python ripper.py -c 500
+
+# show public tracks too
+python ripper.py -c 300 -v
+
+# show everything (public + misses)
+python ripper.py -c 300 -vv
 ```
 
----
-##### Educationnal purposes only, use it at your own risk.
----
+Results are saved live to `output.json` as private tracks are found.
 
-### Dependencies
-use `pip install -r requirements.txt` to fulfill these
+## Options
 
----
-### CLI Arguments
-- -h  |  print out the possible commands
----
-- -r  |  base number of requests
-- -t  |  number of simultaneous threads **(multiplies the number of requests)**
----
-- -x  |  exports the positive results in a xml file (output.xml), *and updates it if it already exists.*
-- -j  |  exports the positive results in a json file (output.json), *and updates it if it already exists.*
----
-- -v   |  prompts positive results in real time
-- -vv |  prompts positive and negative results in real time
----
-- -c | specify the soundcloud client id to ignore public/deleted tracks
-
----
-### Usage
-you can run the script without any arguments, the default values are enough for testing (25 requests, 1 thread, verbose mode).
-
-##### Example usage with arguments
-```
-python3 ripper.py -r 5 -t 5 -x
-(run cloudripper for 25(5*5) requests, and export positive results in xml)
-```
----
-### why python ?
-why not (i have regrets)
+| Flag | Description |
+|------|-------------|
+| `-c N` | Concurrent requests (default: 200) |
+| `-v` | Show public tracks as they're hit |
+| `-vv` | Show all misses too |

